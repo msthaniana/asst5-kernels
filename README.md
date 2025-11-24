@@ -111,7 +111,7 @@ If you wish to write a solution directly in CUDA, under each problem folder, cre
 
 __You may skip this section if you do not wish to run code on a local machine.__
 
-You can develop by editing code locally and using the job queue to run jobs, or you can develop and run your solutions locally on any CUDA-capable NVIDIA GPU machine (e.g., the AWS `g6.xlarge` (NVIDIA T4 GPU) from Assignment 3, if you still have credits). However, development on other machines should be for correctness and exploring options.  We want you to tune performance for the H100, and report on your analysis on the H100. As you've learned in this class, decisions you make for one type of processor might not be optimal decisions for another.  Be ware of this if you spend most of your time developing on a smaller GPU.
+You can develop by editing code locally and using the job queue to run jobs, or you can develop and run your solutions locally on any CUDA-capable NVIDIA GPU machine (e.g., the AWS `g6.xlarge` (NVIDIA L4 GPU), if you still have credits). However, development on other machines should be for correctness and exploring options.  We want you to tune performance for the H100, and report on your analysis on the H100. As you've learned in this class, decisions you make for one type of processor might not be optimal decisions for another.  Be ware of this if you spend most of your time developing on a smaller GPU.
 
 Below is an example of setting up local development environment on `g6.xlarge` with `Deep Learning OSS Nvidia Driver AMI GPU PyTorch 2.8 (Ubuntu 24.04)` AMI.
 
@@ -145,6 +145,13 @@ If you want to use inline CUDA, run this before executing `eval.py` if you encou
 ```
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
 ```
+
+If the `popcorn-cli` was not automatically added to the PATH, please do this:
+```
+sudo chown ubuntu:ubuntu ~/.bashrc
+export PATH="<path_to_asst/target/release>:$PATH"
+```
+
 ### Step 5: Submit Your Solution
 
 #### Command Format
@@ -167,7 +174,7 @@ After running this command, you will get the link to the job page in terminal. t
 
 #### Viewing Profiling Results 
 
-When profiling is enabled, we produce a summary of profiling statistics that includes useful metrics that hopefully useful to you in guiding optimization decisions.  For example, here's a profile summary that suggests a particular kernel is not yet making great use of the GPU (why is that?)
+When profiling is enabled, we produce a summary of profiling statistics that includes useful metrics that hopefully useful to you in guiding optimization decisions. For rk4, only the first 20 kernels will be reported in the profiling results. For example, here's a profile summary that suggests a particular kernel is not yet making great use of the GPU (why is that?)
 
 ````
   NCU Report:
