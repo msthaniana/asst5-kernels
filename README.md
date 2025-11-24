@@ -1,5 +1,11 @@
 # Assignment 5 - Write a Fast Kernel # 
 
+**Due Thursday Nov 13, 11:59pm**
+
+**100 points total**
+
+## Overview ##
+
 This assignment is an open ended assignment that is a bit different than your prior programming assignments in CS149. Really we want you to think about it as a very short final project that we've calibrated so that you can get a decent score on it from about 2 evenings of work. But we've also designed it so that teams that really want to get deep into it can spend a significant amount of time pursuing __very fast code implementations on a modern high-end GPU__.  There is no single task to optimize, and there is no performance bar that determines your score. Instead we are asking you to pick one (or more) of a palette of AI-related kernels we've provided, and then produce an optimizated implementation of the code for an H100 GPU. (All the kernels have baseline implementations in PyTorch.)
 
 For fun, and to you help you track where your implementation stands compared to others in the class, we are running a class leaderboard for each of the kernels, and you'll be able to see how fast your implementation is compared to those of your classmates!
