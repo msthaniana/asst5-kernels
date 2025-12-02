@@ -124,9 +124,7 @@ __global__ void optimized_flash_attention_kernel(
     }
     
     // Initialize output to zero (parallelized across threads)
-    for (int d = tid; d < head_dim; d += num_threads) {
-        o_vec[d] = static_cast<scalar_t>(0.0f);
-    }
+    o_vec[tid] = static_cast<scalar_t>(0.0f);
     __syncthreads();
     
     // Iterate over Key/Value blocks
@@ -141,11 +139,7 @@ __global__ void optimized_flash_attention_kernel(
             
             // ===== PARALLEL DOT PRODUCT =====
             // Each thread computes partial dot product over its assigned dimensions
-            float partial_score = 0.0f;
-            for (int d = tid; d < head_dim; d += num_threads) {
-                partial_score += static_cast<float>(q_vec[d]) * 
-                                static_cast<float>(k_vec[d]);
-            }
+            float partial_score = static_cast<float>(q_vec[tid]) * static_cast<float>(k_vec[tid]);
             
             // Reduce to get complete score
             float score = block_reduce_sum(partial_score, shared_mem);
@@ -172,24 +166,20 @@ __global__ void optimized_flash_attention_kernel(
             
             // ===== PARALLEL OUTPUT UPDATE =====
             // Each thread updates its assigned dimensions
-            for (int d = tid; d < head_dim; d += num_threads) {
-                float o_val = static_cast<float>(o_vec[d]);
-                float v_val = static_cast<float>(v_vec[d]);
+            float o_val = static_cast<float>(o_vec[tid]);
+            float v_val = static_cast<float>(v_vec[tid]);
                 
-                o_val = o_val * alpha + v_val * beta;
+            o_val = o_val * alpha + v_val * beta;
                 
-                o_vec[d] = static_cast<scalar_t>(o_val);
-            }
+            o_vec[tid] = static_cast<scalar_t>(o_val);
             __syncthreads();
         }
     }
     
     // ===== PARALLEL FINAL NORMALIZATION =====
     float l_i = shared_l_i;
-    for (int d = tid; d < head_dim; d += num_threads) {
-        float o_val = static_cast<float>(o_vec[d]);
-        o_vec[d] = static_cast<scalar_t>(o_val / l_i);
-    }
+    float o_val = static_cast<float>(o_vec[tid]);
+    o_vec[tid] = static_cast<scalar_t>(o_val / shared_l_i);
 }
 
 // ------------------------------------------------------------------------
@@ -214,7 +204,7 @@ torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K,
   // Block: 1 thread (This is a simplified naive kernel)
   int total_threads = batch_size * num_heads * seq_len;
   dim3 blocks(total_threads);
-  dim3 threads(THREADS_PER_BLOCK);
+  dim3 threads(head_dim);
 
   // 4. Dispatch and Launch
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
