@@ -95,14 +95,14 @@ __global__ void optimized_flash_attention_kernel(
     
     // ===== SHARED MEMORY ALLOCATION =====
     // Cache Q vector (reused seq_len times)
-    __shared__ float smem_Q[128+8];  // NOTE: Assuming head_dim <= 128
+    __shared__ float smem_Q[128];  // NOTE: Assuming head_dim <= 128
     
     // Cache K and V tiles (TILE_SIZE_K vectors at a time)
-    __shared__ float smem_K[TILE_SIZE][128+8];  // [TILE_SIZE][head_dim]
-    __shared__ float smem_V[TILE_SIZE][128+8];  // [TILE_SIZE][head_dim]
+    __shared__ float smem_K[TILE_SIZE][128];  // [TILE_SIZE][head_dim]
+    __shared__ float smem_V[TILE_SIZE][128];  // [TILE_SIZE][head_dim]
     
     // Accumulate output in shared memory (to avoid repeated global writes)
-    __shared__ float smem_O[128+8];  // [head_dim]
+    __shared__ float smem_O[128];  // [head_dim]
     
     // Shared memory for reductions and online softmax
     __shared__ float shared_mem[THREADS_PER_BLOCK / WARP_SIZE];
