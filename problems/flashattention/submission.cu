@@ -8,15 +8,13 @@
 #include <cmath>
 #include <vector>
 
-// ------------------------------------------------------------------------
-// Configuration Constants
-// ------------------------------------------------------------------------
+// Constants
+#define TILE_SIZE 16
 #define THREADS_PER_BLOCK 256
 #define WARP_SIZE 32
-#define TILE_SIZE 16        // Your current tile size
 
 // ------------------------------------------------------------------------
-// Warp-level Reduction Utilities
+// Warp-level reduction utilities
 // ------------------------------------------------------------------------
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -35,7 +33,7 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 // ------------------------------------------------------------------------
-// Block-level Reduction Utilities
+// Block-level reduction utilities
 // ------------------------------------------------------------------------
 __device__ __forceinline__ float block_reduce_sum(float val, float* shared) {
     int tid = threadIdx.x;
@@ -86,36 +84,32 @@ __device__ __forceinline__ float block_reduce_max(float val, float* shared) {
 }
 
 // ------------------------------------------------------------------------
-// Optimized Kernel with Minimal Synchronization
+// Optimized FlashAttention CUDA Kernel
 // ------------------------------------------------------------------------
 template <typename scalar_t>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2)
-optimized_flash_attention_kernel(
-    const scalar_t* __restrict__ Q, 
-    const scalar_t* __restrict__ K,
-    const scalar_t* __restrict__ V, 
-    scalar_t* __restrict__ O,
-    const int batch_size, 
-    const int num_heads, 
-    const int seq_len,
-    const int head_dim, 
-    const float scale) {
+__global__ void optimized_flash_attention_kernel(
+    const scalar_t* __restrict__ Q, const scalar_t* __restrict__ K,
+    const scalar_t* __restrict__ V, scalar_t* __restrict__ O,
+    const int batch_size, const int num_heads, const int seq_len,
+    const int head_dim, const float scale) {
     
     // ===== SHARED MEMORY ALLOCATION =====
-    __shared__ float smem_Q[128];
-    __shared__ float smem_K[TILE_SIZE][128];
-    __shared__ float smem_V[TILE_SIZE][128];
-    __shared__ float smem_O[128];
+    // Cache Q vector (reused seq_len times)
+    __shared__ float smem_Q[128+8];  // NOTE: Assuming head_dim <= 128
     
-    // Storage for scores
-    __shared__ float smem_scores[TILE_SIZE];
+    // Cache K and V tiles (TILE_SIZE_K vectors at a time)
+    __shared__ float smem_K[TILE_SIZE][128+8];  // [TILE_SIZE][head_dim]
+    __shared__ float smem_V[TILE_SIZE][128+8];  // [TILE_SIZE][head_dim]
     
-    // Reduction scratch space
-    __shared__ float shared_reduce[THREADS_PER_BLOCK / WARP_SIZE];
+    // Accumulate output in shared memory (to avoid repeated global writes)
+    __shared__ float smem_O[128+8];  // [head_dim]
     
-    // Online softmax state
+    // Shared memory for reductions and online softmax
+    __shared__ float shared_mem[THREADS_PER_BLOCK / WARP_SIZE];
     __shared__ float shared_m_i;
     __shared__ float shared_l_i;
+    __shared__ float shared_alpha;
+    __shared__ float shared_beta;
     
     // Thread indices
     int tid = threadIdx.x;
@@ -134,102 +128,92 @@ optimized_flash_attention_kernel(
     const scalar_t* q_vec = Q + base_offset + (token_idx * head_dim);
     scalar_t* o_vec = O + base_offset + (token_idx * head_dim);
     
-    // ===== INITIALIZATION =====
+    // ===== STEP 1: LOAD Q INTO SHARED MEMORY =====
+    // Load once, reuse seq_len times!
     for (int d = tid; d < head_dim; d += num_threads) {
         smem_Q[d] = static_cast<float>(q_vec[d]);
-        smem_O[d] = 0.0f;
     }
     
+    // Initialize online softmax state
     if (tid == 0) {
         shared_m_i = -INFINITY;
         shared_l_i = 0.0f;
     }
     
-    __syncthreads();  // Sync #1: After initialization
+    // Initialize output accumulator in shared memory
+    for (int d = tid; d < head_dim; d += num_threads) {
+        smem_O[d] = 0.0f;
+    }
+    __syncthreads();
     
-    // ===== MAIN LOOP: Process K/V in tiles =====
+    // ===== STEP 2: ITERATE OVER K/V TILES =====
     for (int tile_start = 0; tile_start < seq_len; tile_start += TILE_SIZE) {
         int tile_size = min(TILE_SIZE, seq_len - tile_start);
         
-        // ========================================
-        // PHASE 1: LOAD K AND V TILES
-        // ========================================
+        // ===== LOAD K AND V TILES INTO SHARED MEMORY =====
+        // All threads cooperate to load the tile
         int total_elements = tile_size * head_dim;
         for (int idx = tid; idx < total_elements; idx += num_threads) {
-            int k_row = idx / head_dim;
-            int k_col = idx % head_dim;
-            int k_idx = tile_start + k_row;
+            int k_row = idx / head_dim;      // Which K/V vector (0 to tile_size-1)
+            int k_col = idx % head_dim;      // Which dimension (0 to head_dim-1)
+            int k_idx = tile_start + k_row;  // Global K/V index
             
             if (k_idx < seq_len) {
-                const scalar_t* k_ptr = K + base_offset + (k_idx * head_dim);
-                const scalar_t* v_ptr = V + base_offset + (k_idx * head_dim);
+                const scalar_t* k_vec = K + base_offset + (k_idx * head_dim);
+                const scalar_t* v_vec = V + base_offset + (k_idx * head_dim);
                 
-                smem_K[k_row][k_col] = static_cast<float>(k_ptr[k_col]);
-                smem_V[k_row][k_col] = static_cast<float>(v_ptr[k_col]);
+                smem_K[k_row][k_col] = static_cast<float>(k_vec[k_col]);
+                smem_V[k_row][k_col] = static_cast<float>(v_vec[k_col]);
             } else {
                 smem_K[k_row][k_col] = 0.0f;
                 smem_V[k_row][k_col] = 0.0f;
             }
         }
+        __syncthreads();
         
-        __syncthreads();  // Sync #2: After loading K/V tile
-        
-        // ========================================
-        // PHASE 2: COMPUTE ALL SCORES IN TILE
-        // ========================================
-        for (int j = tid; j < tile_size; j += num_threads) {
-            float score = 0.0f;
-            
-            #pragma unroll 8
-            for (int d = 0; d < head_dim; ++d) {
-                score += smem_Q[d] * smem_K[j][d];
-            }
-            
-            smem_scores[j] = score * scale;
-        }
-        
-        __syncthreads();  // Sync #3: After computing all scores
-        
-        // ========================================
-        // PHASE 3: PROCESS TILE WITH CORRECT ONLINE SOFTMAX
-        // ========================================
-        // This is the key fix: process sequentially WITHIN the tile
-        // to maintain correctness
-        
+        // ===== STEP 3: PROCESS TILE (ALL FROM SHARED MEMORY) =====
         for (int j = 0; j < tile_size; ++j) {
-            float score = smem_scores[j];
             
-            // Online softmax update (thread 0 computes, broadcasts)
-            if (tid == 0) {
-                float m_prev = shared_m_i;
-                float m_new = fmaxf(shared_m_i, score);
-                shared_m_i = m_new;
-                
-                float alpha = expf(m_prev - m_new);
-                float beta = expf(score - m_new);
-                
-                shared_l_i = shared_l_i * alpha + beta;
-                
-                // Store alpha and beta for all threads
-                smem_scores[TILE_SIZE] = alpha;
-                smem_scores[TILE_SIZE + 1] = beta;
+            // ===== PARALLEL DOT PRODUCT (Q @ K) =====
+            float partial_score = 0.0f;
+            for (int d = tid; d < head_dim; d += num_threads) {
+                partial_score += smem_Q[d] * smem_K[j][d];
             }
-            __syncthreads();  // Sync: After computing alpha/beta
             
-            float alpha = smem_scores[TILE_SIZE];
-            float beta = smem_scores[TILE_SIZE + 1];
+            // Reduce to get complete score
+            float score = block_reduce_sum(partial_score, shared_mem);
+            __syncthreads();
             
-            // Update output
+            // ===== ONLINE SOFTMAX UPDATE =====
+            if (tid == 0) {
+                score *= scale;
+                
+                float m_prev = shared_m_i;
+                shared_m_i = fmaxf(shared_m_i, score);
+                
+                shared_alpha = expf(m_prev - shared_m_i);
+                shared_beta = expf(score - shared_m_i);
+                
+                shared_l_i = (shared_l_i * shared_alpha) + shared_beta;
+            }
+            __syncthreads();
+            
+            float alpha = shared_alpha;
+            float beta = shared_beta;
+            
+            // ===== UPDATE OUTPUT (USING SHARED MEMORY) =====
+            // Update output accumulator in shared memory (not global!)
             for (int d = tid; d < head_dim; d += num_threads) {
                 smem_O[d] = smem_O[d] * alpha + smem_V[j][d] * beta;
             }
-            __syncthreads();  // Sync: After updating output
+            __syncthreads();
         }
         
-        // Tile processed
+        // Tile processed, ready for next tile
     }
     
-    // ===== FINAL NORMALIZATION AND WRITE BACK =====
+    // ===== STEP 4: FINAL NORMALIZATION & WRITE BACK =====
+    // Normalize and write output to global memory (ONLY ONCE!)
     float l_i = shared_l_i;
     for (int d = tid; d < head_dim; d += num_threads) {
         o_vec[d] = static_cast<scalar_t>(smem_O[d] / l_i);
