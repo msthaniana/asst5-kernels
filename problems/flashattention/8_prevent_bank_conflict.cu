@@ -8,12 +8,12 @@
 using namespace nvcuda;
 
 // --- Kernel Parameters ---
-#define BLOCK_M 32
+#define BLOCK_M 64
 #define BLOCK_N 64
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
-#define THREADS_PER_BLOCK 256
+#define THREADS_PER_BLOCK 512
 
 // --- THE FIX: PADDING FOR SHARED MEMORY ---
 // Pad head_dim to avoid 32-way bank conflicts. Stride of 128 is disastrous.
@@ -43,8 +43,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) wmma_flash_attention_kernel
     // 64 * sizeof(half) = 128 bytes. 128/4=32. This is also a bank conflict!
     // We should pad this as well. Let's use BLOCK_N + 8 = 72.
     constexpr int SHMEM_BLOCK_N_PADDED = BLOCK_N + 8;
-    half* k_tile_t = reinterpret_cast<half*>(shmem + offset);
-    offset += head_dim * SHMEM_BLOCK_N_PADDED * sizeof(half);
+
+    half* k_tile = reinterpret_cast<half*>(shmem + offset);
+    offset += BLOCK_N * SHMEM_HEAD_DIM_PADDED * sizeof(half);  // [BLOCK_N][head_dim]
     
     half* v_tile = reinterpret_cast<half*>(shmem + offset);
     offset += BLOCK_N * SHMEM_HEAD_DIM_PADDED * sizeof(half);
@@ -99,46 +100,55 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) wmma_flash_attention_kernel
         // --- Load K and V Tiles ---
         const int kv_elems_to_load = BLOCK_N * head_dim;
         for (int i = tid; i < kv_elems_to_load; i += THREADS_PER_BLOCK) {
-            int row = i / head_dim;
-            int col = i % head_dim;
+            int row = i / head_dim;  // 0 to BLOCK_N-1
+            int col = i % head_dim;  // 0 to 127
+            
             if (j_block_start + row < seq_len) {
                 int kv_gmem_offset = ((batch_idx * num_heads + head_idx) * seq_len + (j_block_start + row)) * head_dim + col;
-                // Store K transposed with padding
-                k_tile_t[col * SHMEM_BLOCK_N_PADDED + row] = K[kv_gmem_offset];
-                // Store V with padding
-                int v_shmem_idx = row * SHMEM_HEAD_DIM_PADDED + col;
-                v_tile[v_shmem_idx] = V[kv_gmem_offset];
+                
+                // Store K and V with same layout: [row][col]
+                k_tile[row * SHMEM_HEAD_DIM_PADDED + col] = K[kv_gmem_offset];
+                v_tile[row * SHMEM_HEAD_DIM_PADDED + col] = V[kv_gmem_offset];
             } else {
-                 k_tile_t[col * SHMEM_BLOCK_N_PADDED + row] = __float2half(0.0f);
-                 int v_shmem_idx = row * SHMEM_HEAD_DIM_PADDED + col;
-                 v_tile[v_shmem_idx] = __float2half(0.0f);
+                k_tile[row * SHMEM_HEAD_DIM_PADDED + col] = __float2half(0.0f);
+                v_tile[row * SHMEM_HEAD_DIM_PADDED + col] = __float2half(0.0f);
             }
         }
         __syncthreads();
 
         // === Step 1: Compute S = Q * K^T ===
         {
-            const int num_s_tiles_n = BLOCK_N / WMMA_N;
-            int s_row_tile_idx = warp_id / num_s_tiles_n;
-            int s_col_tile_idx = warp_id % num_s_tiles_n;
-            int s_row_start = s_row_tile_idx * WMMA_M;
-            int s_col_start = s_col_tile_idx * WMMA_N;
+            const int num_s_tiles_m = BLOCK_M / WMMA_M;  // 8 tiles
+            const int num_s_tiles_n = BLOCK_N / WMMA_N;  // 4 tiles
+            const int total_tiles = num_s_tiles_m * num_s_tiles_n;  // 32 tiles
+            
+            for (int tile_idx = warp_id; tile_idx < total_tiles; tile_idx += (THREADS_PER_BLOCK / 32)) {
+                int s_row_tile_idx = tile_idx / num_s_tiles_n;
+                int s_col_tile_idx = tile_idx % num_s_tiles_n;
+                int s_row_start = s_row_tile_idx * WMMA_M;
+                int s_col_start = s_col_tile_idx * WMMA_N;
 
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_q;
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_k;
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_s;
-            wmma::fill_fragment(frag_s, 0.0f);
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_q;
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> frag_k;  // col_major!
+                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_s;
+                wmma::fill_fragment(frag_s, 0.0f);
 
-            for (int k_step = 0; k_step < head_dim; k_step += WMMA_K) {
-                half* q_ptr = &q_tile[s_row_start * SHMEM_HEAD_DIM_PADDED + k_step];
-                half* k_ptr = &k_tile_t[k_step * SHMEM_BLOCK_N_PADDED + s_col_start];
+                for (int k_step = 0; k_step < head_dim; k_step += WMMA_K) {
+                    // Q: Load row s_row_start, starting at column k_step
+                    half* q_ptr = &q_tile[s_row_start * SHMEM_HEAD_DIM_PADDED + k_step];
+                    
+                    // K^T: We want columns s_col_start to s_col_start+15
+                    // Since K is stored as [BLOCK_N][head_dim], row s_col_start gives us what we need
+                    half* k_ptr = &k_tile[s_col_start * SHMEM_HEAD_DIM_PADDED + k_step];
 
-                wmma::load_matrix_sync(frag_q, q_ptr, SHMEM_HEAD_DIM_PADDED);
-                wmma::load_matrix_sync(frag_k, k_ptr, SHMEM_BLOCK_N_PADDED);
-                wmma::mma_sync(frag_s, frag_q, frag_k, frag_s);
+                    wmma::load_matrix_sync(frag_q, q_ptr, SHMEM_HEAD_DIM_PADDED);
+                    wmma::load_matrix_sync(frag_k, k_ptr, SHMEM_HEAD_DIM_PADDED);  // Loaded as col_major
+                    wmma::mma_sync(frag_s, frag_q, frag_k, frag_s);
+                }
+                
+                float* s_ptr = &s_tile[s_row_start * SHMEM_BLOCK_N_PADDED + s_col_start];
+                wmma::store_matrix_sync(s_ptr, frag_s, SHMEM_BLOCK_N_PADDED, wmma::mem_row_major);
             }
-            float* s_ptr = &s_tile[s_row_start * SHMEM_BLOCK_N_PADDED + s_col_start];
-            wmma::store_matrix_sync(s_ptr, frag_s, SHMEM_BLOCK_N_PADDED, wmma::mem_row_major);
         }
         __syncthreads();
 
@@ -253,12 +263,12 @@ torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K, torch::T
 
     constexpr int SHMEM_BLOCK_N_PADDED = BLOCK_N + 8;
     size_t shmem_size = (BLOCK_M * SHMEM_HEAD_DIM_PADDED * sizeof(half))  // q_tile
-                      + (head_dim * SHMEM_BLOCK_N_PADDED * sizeof(half))   // k_tile_t
-                      + (BLOCK_N * SHMEM_HEAD_DIM_PADDED * sizeof(half))   // v_tile
-                      + (BLOCK_M * SHMEM_BLOCK_N_PADDED * sizeof(float))   // s_tile
-                      + (BLOCK_M * SHMEM_BLOCK_N_PADDED * sizeof(half))    // p_tile
-                      + (BLOCK_M * SHMEM_HEAD_DIM_PADDED * sizeof(float))  // o_tile
-                      + (BLOCK_M * 2 * sizeof(float));                     // m/l_tiles
+                    + (BLOCK_N * SHMEM_HEAD_DIM_PADDED * sizeof(half))   // k_tile (CHANGED!)
+                    + (BLOCK_N * SHMEM_HEAD_DIM_PADDED * sizeof(half))   // v_tile
+                    + (BLOCK_M * SHMEM_BLOCK_N_PADDED * sizeof(float))   // s_tile
+                    + (BLOCK_M * SHMEM_BLOCK_N_PADDED * sizeof(half))    // p_tile
+                    + (BLOCK_M * SHMEM_HEAD_DIM_PADDED * sizeof(float))  // o_tile
+                    + (BLOCK_M * 2 * sizeof(float));                     // m/l_tiles
 
     cudaFuncSetAttribute(wmma_flash_attention_kernel_v6,
                         cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
