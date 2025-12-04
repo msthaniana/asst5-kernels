@@ -201,13 +201,19 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) flash_attention_pipelined_k
     for (int kv_iter = 0; kv_iter < kv_iters; ++kv_iter) {
         float regs_s[Q_TILES_PER_WARP][KV_TILES_PER_BLOCK][4] = {};
 
-        // Prefetch K for the *next* iteration (n+1)
-        load_k_tile(kv_iter + 1);
-        
-        // Wait for K from the *current* iteration (n) to be loaded.
-        // wait_group 2 because we prefetched K and V before the loop.
-        asm volatile("cp.async.wait_group 2;");
+        asm volatile("cp.async.wait_group 0;");
         __syncthreads();
+
+        // Prefetch K and V for the *next* iteration (n+1)
+        if (kv_iter + 1 < kv_iters) {
+            load_k_tile(kv_iter + 1);
+            load_v_tile(kv_iter + 1);
+        }
+        
+        // // Wait for K from the *current* iteration (n) to be loaded.
+        // // wait_group 2 because we prefetched K and V before the loop.
+        // asm volatile("cp.async.wait_group 2;");
+        // __syncthreads();
 
         // Load K from shared to registers
         for (int kv_tile_idx = 0; kv_tile_idx < KV_TILES_PER_BLOCK; ++kv_tile_idx) {
@@ -227,9 +233,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) flash_attention_pipelined_k
                 }
             }
         }
-
-        // Prefetch V for the *next* iteration (n+1)
-        load_v_tile(kv_iter + 1);
 
         // Online Softmax
         for (int q_tile_idx = 0; q_tile_idx < Q_TILES_PER_WARP; ++q_tile_idx) {
@@ -271,8 +274,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) flash_attention_pipelined_k
         }
 
         // Wait for V from the *current* iteration (n) to be loaded.
-        asm volatile("cp.async.wait_group 2;");
-        __syncthreads();
+        // asm volatile("cp.async.wait_group 2;");
+        // __syncthreads();
 
         // Load V from shared to registers
         for (int kv_tile_idx = 0; kv_tile_idx < (BLOCK_COLS_KV / MMA_DIM_K); ++kv_tile_idx) {
