@@ -58,7 +58,7 @@ cuda_module = load_inline(
     functions=['flash_attention_forward'],
     verbose=True,        # Print compilation log
     # with_cuda=True,
-    # extra_cuda_cflags=["-O2"]
+    extra_cuda_cflags=["-O3"]
 )
 # print("Compilation complete.")
 
